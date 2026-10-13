@@ -34,78 +34,153 @@ env:
   UPDATER_DEFCONFIG: defconfig/mt7981-ax3000.config
 
 jobs:
-  setup:
-    runs-on: ubuntu-latest
-    outputs:
-      repo_url: ${{ steps.get-env.outputs.repo_url }}
-      repo_branch: ${{ steps.get-env.outputs.repo_branch }}
-      feeds_conf: ${{ steps.get-env.outputs.feeds_conf }}
-      config_file: ${{ steps.get-env.outputs.config_file }}
-      diy_p1_sh: ${{ steps.get-env.outputs.diy_p1_sh }}
-      diy_p2_sh: ${{ steps.get-env.outputs.diy_p2_sh }}
-      release_file: ${{ steps.get-env.outputs.release_file }}
-      upload_bin_dir: ${{ steps.get-env.outputs.upload_bin_dir }}
-      upload_firmware: ${{ steps.get-env.outputs.upload_firmware }}
-      upload_release: ${{ steps.get-env.outputs.upload_release }}
-      tz: ${{ steps.get-env.outputs.tz }}
+  build:
+    runs-on: ubuntu-22.04
 
     steps:
-      - name: Get environment from env
-        id: get-env
-        run: |
-          echo "repo_url=${{ env.REPO_URL }}" >> $GITHUB_OUTPUT
-          echo "repo_branch=${{ env.REPO_BRANCH }}" >> $GITHUB_OUTPUT
-          echo "feeds_conf=${{ env.FEEDS_CONF }}" >> $GITHUB_OUTPUT
-          echo "config_file=${{ env.CONFIG_FILE }}" >> $GITHUB_OUTPUT
-          echo "diy_p1_sh=${{ env.DIY_P1_SH }}" >> $GITHUB_OUTPUT
-          echo "diy_p2_sh=${{ env.DIY_P2_SH }}" >> $GITHUB_OUTPUT
-          echo "release_file=${{ env.RELEASE_FILE }}" >> $GITHUB_OUTPUT
-          echo "upload_bin_dir=${{ env.UPLOAD_BIN_DIR }}" >> $GITHUB_OUTPUT
-          echo "upload_firmware=${{ env.UPLOAD_FIRMWARE }}" >> $GITHUB_OUTPUT
-          echo "upload_release=${{ env.UPLOAD_RELEASE }}" >> $GITHUB_OUTPUT
-          echo "tz=${{ env.TZ }}" >> $GITHUB_OUTPUT
+    - name: Checkout
+      uses: actions/checkout@main
 
-  call-builder:
-    needs: setup
-    uses: ./.github/workflows/image-builder.yml
-    with:
-      repo_url: ${{ needs.setup.outputs.repo_url }}
-      repo_branch: ${{ needs.setup.outputs.repo_branch }}
-      feeds_conf: ${{ needs.setup.outputs.feeds_conf }}
-      config_file: ${{ needs.setup.outputs.config_file }}
-      diy_p1_sh: ${{ needs.setup.outputs.diy_p1_sh }}
-      diy_p2_sh: ${{ needs.setup.outputs.diy_p2_sh }}
-      release_file: ${{ needs.setup.outputs.release_file }}
-      upload_bin_dir: ${{ needs.setup.outputs.upload_bin_dir == 'true' }}
-      upload_firmware: ${{ needs.setup.outputs.upload_firmware == 'true' }}
-      upload_release: ${{ needs.setup.outputs.upload_release == 'true' }}
-      tz: ${{ needs.setup.outputs.tz }}
+    - name: Initialization environment
+      env:
+        DEBIAN_FRONTEND: noninteractive
+      run: |
+        sudo rm -rf /etc/apt/sources.list.d/* /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+        sudo docker image prune --all --force
+        sudo -E apt-get -qq update
+        sudo -E apt-get -qq install ack antlr3 asciidoc autoconf automake autopoint binutils bison build-essential bzip2 ccache clang cmake cpio curl device-tree-compiler ecj fastjar flex gawk gettext gcc-multilib g++-multilib git gnutls-dev gperf haveged help2man intltool lib32gcc-s1 libc6-dev-i386 libelf-dev libglib2.0-dev libgmp3-dev libltdl-dev libmpc-dev libmpfr-dev libncurses-dev libpython3-dev libreadline-dev libssl-dev libtool libyaml-dev libz-dev lld llvm lrzsz mkisofs msmtp nano ninja-build p7zip p7zip-full patch pkgconf python3 python3-pip python3-ply python3-docutils python3-pyelftools qemu-utils re2c rsync scons squashfs-tools subversion swig texinfo uglifyjs upx-ucl unzip vim wget xmlto xxd zlib1g-dev zstd
+        sudo -E apt-get -qq autoremove --purge
+        sudo -E apt-get -qq clean
+        sudo timedatectl set-timezone "$TZ"
+        sudo mkdir -p /workdir
+        sudo chown $USER:$GROUPS /workdir
 
-  update-cache:
-    runs-on: ubuntu-latest
-    needs: call-builder
-    if: ${{ github.actor != 'github-actions[bot]' }}
-    steps:
-      - name: Get current workflow filename
-        id: get-filename
-        run: |
-          FILENAME=$(curl -s -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
-            "https://api.github.com/repos/${{ github.repository }}/actions/runs/${{ github.run_id }}" | \
-            jq -r '.path | split("/") | .[-1]')
+    - name: Clone source code
+      working-directory: /workdir
+      run: |
+        df -hT $PWD
+        git clone $REPO_URL -b $REPO_BRANCH openwrt
+        ln -sf /workdir/openwrt $GITHUB_WORKSPACE/openwrt
 
-          FILENAME=${FILENAME%.yml}
+    - name: Load custom feeds
+      run: |
+        [ -e $FEEDS_CONF ] && mv $FEEDS_CONF openwrt/feeds.conf.default
+        chmod +x $DIY_P1_SH
+        cd openwrt
+        $GITHUB_WORKSPACE/$DIY_P1_SH
 
-          echo "filename=$FILENAME" >> $GITHUB_OUTPUT
-          echo "Current workflow file: $FILENAME"
+    - name: Update feeds
+      run: |
+         cd openwrt
+         ./scripts/feeds update -a
+         rm -rf feeds/packages/lang/golang
+         git clone https://github.com/kenzok8/golang -b 1.25 feeds/packages/lang/golang
 
-      - name: Force update repo hash cache
-        id: cache-repo-hash
-        uses: actions/cache@v3
-        with:
-          path: .repo-hash
-          key: repo-hash_${{ steps.get-filename.outputs.filename }}_${{ needs.call-builder.outputs.repo_hash }}
-          lookup-only: true
 
-      - name: Cache repo hash
+    - name: Install feeds
+      run: |
+        cd openwrt
+        ./scripts/feeds install -a 
+        
+        # 移除 openwrt feeds 自带的核心库
+        rm -rf feeds/packages/net/{xray-core,v2ray-geodata,sing-box,chinadns-ng,dns2socks,hysteria,ipt2socks,microsocks,naiveproxy,shadowsocks-rust,shadowsocksr-libev,simple-obfs,tcping,v2ray-plugin,xray-plugin,geoview,shadow-tls}
+        git clone https://github.com/Openwrt-Passwall/openwrt-passwall-packages package/passwall-packages
+
+        # 移除 openwrt feeds 过时的luci版本
+        rm -rf feeds/luci/applications/luci-app-passwall
+        git clone https://github.com/Openwrt-Passwall/openwrt-passwall package/passwall-luci
+          
+    - name: Load custom configuration
+      run: |
+        # [ -e files ] && mv files openwrt/files
+        [ -e $CONFIG_FILE ] && mv $CONFIG_FILE openwrt/.config
+        chmod +x $DIY_P2_SH
+        cd openwrt
+        $GITHUB_WORKSPACE/$DIY_P2_SH
+
+    - name: Download package
+      id: package
+      run: |
+        cd openwrt
+        make defconfig
+        make download -j8
+        find dl -size -1024c -exec ls -l {} \;
+        find dl -size -1024c -exec rm -f {} \;
+
+    - name: Compile the firmware
+      id: compile
+      run: |
+        cd openwrt
+        echo -e "$(nproc) thread compile"
+        make -j$(nproc) || make -j1 || make -j1 V=s
+        echo "status=success" >> $GITHUB_OUTPUT
+        grep '^CONFIG_TARGET.*DEVICE.*=y' .config | sed -r 's/.*DEVICE_(.*)=y/\1/' > DEVICE_NAME
+        [ -s DEVICE_NAME ] && echo "DEVICE_NAME=_$(cat DEVICE_NAME)" >> $GITHUB_ENV
+        echo "FILE_DATE=_$(date +"%Y%m%d%H%M")" >> $GITHUB_ENV
+
+    - name: Check space usage
+      if: (!cancelled())
+      run: df -hT
+
+    - name: Upload bin directory
+      uses: actions/upload-artifact@main
+      if: steps.compile.outputs.status == 'success' && env.UPLOAD_BIN_DIR == 'true'
+      with:
+        name: OpenWrt_bin${{ env.DEVICE_NAME }}${{ env.FILE_DATE }}
+        path: openwrt/bin
+
+    - name: Organize files
+      id: organize
+      if: env.UPLOAD_FIRMWARE == 'true' && !cancelled()
+      run: |
+        cd openwrt/bin/targets/*/*
+        rm -rf packages
+        echo "FIRMWARE=$PWD" >> $GITHUB_ENV
+        echo "status=success" >> $GITHUB_OUTPUT
+
+    - name: Upload firmware directory
+      uses: actions/upload-artifact@main
+      if: steps.organize.outputs.status == 'success' && !cancelled()
+      with:
+        name: OpenWrt_firmware${{ env.DEVICE_NAME }}${{ env.FILE_DATE }}
+        path: ${{ env.FIRMWARE }}
+
+    - name: Generate release tag
+      id: tag
+      if: env.UPLOAD_RELEASE == 'true' && !cancelled()
+      run: |
+        echo "release_tag=$(date +"%Y.%m.%d-%H%M")" >> $GITHUB_OUTPUT
+        touch "${RELEASE_FILE}"
+
+        if [ "${UPLOAD_GOFILE}" = "true" ] && [ -n "${{ steps.gofile.outputs.url }}" ]; then
+          echo "{U+0001F517} [GoFile](${{ steps.gofile.outputs.url }})" >> "${RELEASE_FILE}"
+        fi
+
+        echo "status=success" >> $GITHUB_OUTPUT
+    
+    - name: Upload firmware to release
+      uses: softprops/action-gh-release@v2
+      if: steps.tag.outputs.status == 'success' && !cancelled()
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        tag_name: ${{ steps.tag.outputs.release_tag }}
+        body_path: ${{ env.RELEASE_FILE }}
+        files: ${{ env.FIRMWARE }}/*
+
+    - name: Delete workflow runs
+      uses: Mattraks/delete-workflow-runs@main
+      with:
+        retain_days: 0
+        keep_minimum_runs: 2
+
+    - name: Remove old Releases
+      uses: dev-drprasad/delete-older-releases@master
+      if: env.UPLOAD_RELEASE == 'true' && !cancelled()
+      with:
+        keep_latest: 1
+        delete_tags: true
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         if: steps.cache-repo-hash.outputs.cache-hit != 'true'
         run: echo ${{ needs.call-builder.outputs.repo_hash }} > .repo-hash
