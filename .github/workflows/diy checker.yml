@@ -1,0 +1,159 @@
+#
+# https://github.com/P3TERX/Actions-OpenWrt
+#
+# File: .github/workflows/update-checker.yml
+# Description: Source code update checker
+#
+# Copyright (c) 2019-2024 P3TERX <https://p3terx.com>
+# Copyright (c) 2025 icyray
+#
+# This is free software, licensed under the MIT License.
+# See /LICENSE for more information.
+#
+
+name: Update Checker
+
+on:
+  workflow_dispatch:
+  schedule:
+   - cron: 0 0 */5 * *
+
+jobs:
+  get-repo:
+    runs-on: ubuntu-latest
+    outputs:
+      repo: ${{ steps.get-env.outputs.result }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@main
+
+      - name: Set up Node.js
+        uses: actions/setup-node@main
+        with:
+          node-version: "24"
+
+      - name: Install dependencies
+        run: |
+          npm init -y
+          npm install js-yaml
+
+      - name: Get environment from workflows
+        id: get-env
+        uses: actions/github-script@main
+        with:
+          script: |
+            const fs = require('fs');
+            const path = require('path');
+            const yaml = require('js-yaml');
+            const result = [];
+
+            const globber = await glob.create('./.github/workflows/*.yml');
+            for await (const file of globber.globGenerator()) {
+                const fileContents = fs.readFileSync(file, 'utf8');
+                const workflow = yaml.load(fileContents);
+                const filename = path.basename(file, '.yml');
+
+                if (!(workflow && workflow.env && workflow.env.UPDATER_ENABLED)) {
+                    console.log('Skipping disabled workflow: ' + file);
+                    continue;
+                }
+
+                const workflowName = workflow.name || filename;
+                const match = workflow.env.REPO_URL.match(/github\.com[\/:]([^\/]+)\/([^\/\s]+?)(?:\.git)?(?:\/.*)?$/);
+                const sourceRepo = match ? `${match[1]}/${match[2]}` : null;
+                const repoBranch = workflow.env.REPO_BRANCH;
+                const repoDefcfg = workflow.env && workflow.env.UPDATER_DEFCONFIG ? workflow.env.UPDATER_DEFCONFIG : null;
+
+                if (!(sourceRepo && repoBranch)) {
+                    console.log('Invalid workflow: ' + file);
+                    continue;
+                }
+
+                result.push({
+                    filename: filename,
+                    name: workflowName,
+                    repo: sourceRepo,
+                    branch: repoBranch,
+                    defcfg: repoDefcfg,
+                });
+            }
+
+            console.log(result);
+            return result;
+
+  check-and-trigger:
+    needs: get-repo
+    strategy:
+      matrix:
+        repo: ${{ fromJson(needs.get-repo.outputs.repo) }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Get commit hash
+        id: get-hash
+        run: |
+          repo_data=$(curl -s -L 'https://api.github.com/repos/${{ matrix.repo.repo }}/commits/${{ matrix.repo.branch }}')
+
+          repo_hash=$(echo "$repo_data" | jq -n -R -r '[inputs] | join("\n") | fromjson? | .sha // empty')
+          repo_message=$(echo "$repo_data" | jq -n -R -r '[inputs] | join("\n") | fromjson? | .commit.message | select(type == "string") | split("\n")[0] // empty')
+
+          echo "repo_hash=${repo_hash}" >> $GITHUB_OUTPUT
+          echo "repo_message=${repo_message}" >> $GITHUB_OUTPUT
+
+      - name: Get defconfig commit hash
+        id: get-def-hash
+        if: matrix.repo.defcfg
+        run: |
+          def_data=$(curl -s -L 'https://api.github.com/repos/${{ matrix.repo.repo }}/commits?path=${{ matrix.repo.defcfg }}&sha=${{ matrix.repo.branch }}')
+
+          def_hash=$(echo "$def_data" | jq -n -R -r '[inputs] | join("\n") | fromjson? | .[0].sha // empty')
+          def_message=$(echo "$def_data" | jq -n -R -r '[inputs] | join("\n") | fromjson? | .[0].commit.message | select(type == "string") | split("\n")[0] // empty')
+
+          echo "def_hash=${def_hash}" >> $GITHUB_OUTPUT
+          echo "def_message=${def_message}" >> $GITHUB_OUTPUT
+
+      - name: Check repo hash
+        id: cache-repo-hash
+        uses: actions/cache@main
+        with:
+          path: .repo-hash
+          key: repo-hash_${{matrix.repo.filename}}_${{ steps.get-hash.outputs.repo_hash }}
+          lookup-only: true
+
+      - name: Check defconfig hash
+        id: cache-def-hash
+        if: matrix.repo.defcfg && steps.get-def-hash.outputs.def_hash != 'null'
+        uses: actions/cache@main
+        with:
+          path: .def-hash
+          key: def-hash_${{matrix.repo.filename}}_${{ steps.get-def-hash.outputs.def_hash }}
+          lookup-only: true
+
+      - name: Cache repo hash
+        if: steps.cache-repo-hash.outputs.cache-hit != 'true'
+        run: echo ${{ steps.get-hash.outputs.repo_hash }} > .repo-hash
+
+      - name: Cache defconfig hash
+        if: matrix.repo.defcfg && steps.get-def-hash.outputs.def_hash != 'null' && steps.cache-def-hash.outputs.cache-hit != 'true'
+        run: echo ${{ steps.get-def-hash.outputs.def_hash }} > .def-hash
+
+      - name: Notification for new defconfig
+        if: matrix.repo.defcfg && steps.get-def-hash.outputs.def_hash != 'null' && steps.cache-def-hash.outputs.cache-hit != 'true'
+        uses: dacbd/create-issue-action@main
+        with:
+          title: "New def-config available for workflow ${{ matrix.repo.name }}"
+          body: |
+            A new defconfig has been detected for workflow `${{ matrix.repo.name }}`.
+            - **Repo**: `${{ matrix.repo.repo }}`
+            - **Branch**: `${{ matrix.repo.branch }}`
+            - **Defconfig**: `${{ matrix.repo.defcfg }}`
+            - **Message**: ${{ steps.get-def-hash.outputs.def_message }}
+            - **Link**: <https://github.com/${{ matrix.repo.repo }}/commit/${{ steps.get-def-hash.outputs.def_hash }}>
+          labels: update-checker, defconfig-update
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Trigger build
+        if: steps.cache-repo-hash.outputs.cache-hit != 'true' && success()
+        uses: benc-uk/workflow-dispatch@main
+        with:
+          workflow: ${{ matrix.repo.name }}
