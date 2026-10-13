@@ -1,0 +1,237 @@
+
+name: Build Cudy TR3000 ImmortalWrt 24.10-6.6
+
+on:
+  workflow_dispatch:
+  repository_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  # ImmortalWrt 源码
+  REPO_URL: https://github.com/padavanonly/immortalwrt-mt798x-24.10
+  REPO_BRANCH: openwrt-24.10-6.6
+
+  # 仓库根目录中的配置文件、DIY 脚本和 Release 说明
+  CONFIG_FILE: cudy-tr3000.config
+  DIY_SH: diy.sh
+  RELEASE_FILE: cudy-tr3000.md
+
+  # 是否上传编译产物
+  UPLOAD_BIN_DIR: "false"
+  UPLOAD_FIRMWARE: "true"
+  UPLOAD_RELEASE: "true"
+
+  TZ: Asia/Shanghai
+
+  # 供 update-checker.yml 识别，保留这两个变量
+  UPDATER_ENABLED: "true"
+  UPDATER_DEFCONFIG: defconfig/mt7981-ax3000.config
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+
+    steps:
+      # 1. 获取当前 GitHub 仓库文件
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # 2. 安装编译环境
+      - name: Initialization environment
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          sudo rm -rf /etc/apt/sources.list.d/*
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          sudo docker image prune --all --force
+
+          sudo -E apt-get update
+          sudo -E apt-get install -y \
+            ack antlr3 asciidoc autoconf automake autopoint \
+            binutils bison build-essential bzip2 ccache clang cmake \
+            cpio curl device-tree-compiler ecj fastjar flex gawk gettext \
+            gcc-multilib g++-multilib git gnutls-dev gperf haveged \
+            help2man intltool lib32gcc-s1 libc6-dev-i386 libelf-dev \
+            libglib2.0-dev libgmp3-dev libltdl-dev libmpc-dev libmpfr-dev \
+            libncurses-dev libpython3-dev libreadline-dev libssl-dev \
+            libtool libyaml-dev libz-dev lld llvm lrzsz mkisofs msmtp \
+            nano ninja-build p7zip p7zip-full patch pkgconf python3 \
+            python3-pip python3-ply python3-docutils python3-pyelftools \
+            qemu-utils re2c rsync scons squashfs-tools subversion swig \
+            texinfo uglifyjs upx-ucl unzip vim wget xmlto xxd zlib1g-dev zstd
+
+          sudo -E apt-get autoremove -y
+          sudo -E apt-get clean
+          sudo timedatectl set-timezone "$TZ"
+
+          sudo mkdir -p /workdir
+          sudo chown "$USER:$USER" /workdir
+
+          df -hT
+
+      # 3. 下载指定分支的 ImmortalWrt 源码
+      - name: Clone source code
+        working-directory: /workdir
+        run: |
+          git clone --depth 1 \
+            -b "$REPO_BRANCH" \
+            "$REPO_URL" \
+            openwrt
+
+          ln -sfn /workdir/openwrt "$GITHUB_WORKSPACE/openwrt"
+
+          echo "Source branch: $REPO_BRANCH"
+          git -C /workdir/openwrt rev-parse HEAD
+
+      # 4. 更新软件源
+      - name: Update feeds
+        run: |
+          cd openwrt
+          ./scripts/feeds update -a
+
+      # 5. 安装软件源中的软件包
+      - name: Install feeds
+        run: |
+          cd openwrt
+          ./scripts/feeds install -a
+
+      # 6. 导入配置并执行合并后的 DIY 脚本
+      - name: Load configuration and run DIY
+        run: |
+          test -f "$GITHUB_WORKSPACE/$CONFIG_FILE" || {
+            echo "ERROR: 找不到配置文件 $CONFIG_FILE"
+            exit 1
+          }
+
+          test -f "$GITHUB_WORKSPACE/$DIY_SH" || {
+            echo "ERROR: 找不到 DIY 脚本 $DIY_SH"
+            exit 1
+          }
+
+          cp "$GITHUB_WORKSPACE/$CONFIG_FILE" openwrt/.config
+
+          cd openwrt
+          bash "$GITHUB_WORKSPACE/$DIY_SH"
+
+      # 7. 整理编译配置并下载依赖包
+      - name: Download package
+        run: |
+          cd openwrt
+
+          echo "===== 检查 .config 文件 ====="
+          test -s .config
+          nl -ba .config | head -n 20
+
+          make defconfig
+          make download -j8
+
+          find dl -size -1024c -exec ls -l {} \;
+          find dl -size -1024c -exec rm -f {} \;
+
+      # 8. 编译固件
+      - name: Compile the firmware
+        id: compile
+        run: |
+          cd openwrt
+
+          echo "===== 开始编译固件 ====="
+          echo "并行线程数：$(nproc)"
+
+          make -j"$(nproc)" || make -j1 || make -j1 V=s
+
+          grep '^CONFIG_TARGET.*DEVICE.*=y' .config \
+            | sed -r 's/.*DEVICE_(.*)=y/\1/' > DEVICE_NAME
+
+          if [ -s DEVICE_NAME ]; then
+            echo "DEVICE_NAME=$(cat DEVICE_NAME)" >> "$GITHUB_ENV"
+          else
+            echo "DEVICE_NAME=unknown" >> "$GITHUB_ENV"
+          fi
+
+          echo "FILE_DATE=$(date +'%Y%m%d%H%M')" >> "$GITHUB_ENV"
+
+      # 9. 显示磁盘使用情况
+      - name: Check space usage
+        if: always()
+        run: df -hT
+
+      # 10. 可选：上传完整 bin 目录
+      - name: Upload bin directory
+        uses: actions/upload-artifact@v4
+        if: success() && env.UPLOAD_BIN_DIR == 'true'
+        with:
+          name: OpenWrt_bin_${{ env.DEVICE_NAME }}_${{ env.FILE_DATE }}
+          path: openwrt/bin
+
+      # 11. 整理固件目录，移除体积较大的 packages 子目录
+      - name: Organize files
+        id: organize
+        if: steps.compile.conclusion == 'success' && env.UPLOAD_FIRMWARE == 'true'
+        run: |
+          TARGET_DIR=$(find openwrt/bin/targets \
+            -mindepth 2 -maxdepth 2 -type d | head -n 1)
+
+          if [ -z "$TARGET_DIR" ]; then
+            echo "ERROR: 没有找到固件输出目录"
+            exit 1
+          fi
+
+          rm -rf "$TARGET_DIR/packages"
+
+          echo "FIRMWARE=$GITHUB_WORKSPACE/$TARGET_DIR" >> "$GITHUB_ENV"
+
+          echo "===== 固件文件列表 ====="
+          ls -lh "$TARGET_DIR"
+
+      # 12. 上传固件为 GitHub Actions 附件
+      - name: Upload firmware directory
+        uses: actions/upload-artifact@v4
+        if: steps.organize.conclusion == 'success'
+        with:
+          name: OpenWrt_firmware_${{ env.DEVICE_NAME }}_${{ env.FILE_DATE }}
+          path: ${{ env.FIRMWARE }}
+
+      # 13. 生成 Release 标签和说明
+      - name: Generate release tag
+        id: tag
+        if: steps.compile.conclusion == 'success' && steps.organize.conclusion == 'success' && env.UPLOAD_RELEASE == 'true'
+        run: |
+          echo "release_tag=$(date +'%Y.%m.%d-%H%M')" >> "$GITHUB_OUTPUT"
+
+          touch "$RELEASE_FILE"
+
+          DEVICE_BADGE=$(printf '%s' "$DEVICE_NAME" | sed 's/-/--/g')
+          BADGE=$(mktemp)
+
+          cat > "$BADGE" << EOF
+          [![Build Time](https://img.shields.io/badge/build-$(date +'%Y--%m--%d_%H%M')-brightgreen?logo=github)]($GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID)
+          ![Device](https://img.shields.io/badge/device-${DEVICE_BADGE}-blue)
+          [![Source Repo](https://img.shields.io/badge/source-repo-orange?logo=github)]($REPO_URL/tree/$REPO_BRANCH)
+          [![Commit](https://img.shields.io/badge/commit-$(git -C openwrt rev-parse --short HEAD)-yellow?logo=github)]($REPO_URL/commit/$(git -C openwrt rev-parse HEAD))
+          EOF
+
+          if grep -q '!\[Badge\]' "$RELEASE_FILE"; then
+            sed -i "/!\[Badge\]/r $BADGE" "$RELEASE_FILE"
+            sed -i "/!\[Badge\]/d" "$RELEASE_FILE"
+          else
+            cat "$BADGE" > release-body.tmp
+            cat "$RELEASE_FILE" >> release-body.tmp
+            mv release-body.tmp "$RELEASE_FILE"
+          fi
+
+          rm -f "$BADGE"
+
+      # 14. 发布固件到 GitHub Releases
+      - name: Upload firmware to release
+        uses: softprops/action-gh-release@v2
+        if: steps.tag.conclusion == 'success' && steps.organize.conclusion == 'success'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: ${{ steps.tag.outputs.release_tag }}
+          name: Cudy TR3000 ImmortalWrt ${{ steps.tag.outputs.release_tag }}
+          body_path: ${{ env.RELEASE_FILE }}
+          files: ${{ env.FIRMWARE }}/*
+          fail_on_unmatched_files: true
