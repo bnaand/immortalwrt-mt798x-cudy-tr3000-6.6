@@ -1,5 +1,5 @@
 
-name: Build Cudy TR3000 ImmortalWrt 24.10-6.6
+name: Build Cudy TR3000 ImmortalWrt 24.10-6.6 - DIY
 
 on:
   workflow_dispatch:
