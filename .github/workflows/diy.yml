@@ -36,7 +36,7 @@ jobs:
     steps:
       # 1. 获取当前 GitHub 仓库文件
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       # 2. 安装编译环境
       - name: Initialization environment
@@ -159,7 +159,7 @@ jobs:
 
       # 10. 可选：上传完整 bin 目录
       - name: Upload bin directory
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         if: success() && env.UPLOAD_BIN_DIR == 'true'
         with:
           name: OpenWrt_bin_${{ env.DEVICE_NAME }}_${{ env.FILE_DATE }}
@@ -187,7 +187,7 @@ jobs:
 
       # 12. 上传固件为 GitHub Actions 附件
       - name: Upload firmware directory
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         if: steps.organize.conclusion == 'success'
         with:
           name: OpenWrt_firmware_${{ env.DEVICE_NAME }}_${{ env.FILE_DATE }}
@@ -225,7 +225,7 @@ jobs:
 
       # 14. 发布固件到 GitHub Releases
       - name: Upload firmware to release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         if: steps.tag.conclusion == 'success' && steps.organize.conclusion == 'success'
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
