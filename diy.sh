@@ -17,12 +17,15 @@ git clone --depth 1 \
   https://github.com/jerrykuku/luci-app-argon-config.git \
   package/luci-app-argon-config
 
-# 2. 更新 Go 语言包
+
+# 2. 更新 Go 语言包到 1.27.x
 rm -rf feeds/packages/lang/golang
 
-git clone --depth 1 --branch 26.x \
+git clone --depth 1 --branch 27.x \
   https://github.com/sbwml/packages_lang_golang \
   feeds/packages/lang/golang
+
+echo "===== Go 编译工具链已切换到 27.x 分支 ====="
 
 # 3. 替换 Passwall 相关依赖包
 rm -rf feeds/packages/net/{xray-core,v2ray-geodata,sing-box,chinadns-ng,dns2socks,hysteria,ipt2socks,microsocks,naiveproxy,shadowsocks-libev,shadowsocks-rust,shadowsocksr-libev,simple-obfs,tcping,trojan-plus,tuic-client,v2ray-plugin,xray-plugin,geoview,shadow-tls}
