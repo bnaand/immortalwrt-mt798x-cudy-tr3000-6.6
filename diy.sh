@@ -59,5 +59,8 @@ git clone --depth 1 \
 sed -i \
   's|IMG_PREFIX:=|IMG_PREFIX:=$(shell TZ="Asia/Shanghai" date +"%Y%m%d")-24.10-6.6-|' \
   include/image.mk
+  
+# 7. 修改默认 LAN IP 为 192.168.10.1
+sed -i 's/192\.168\.6\.1/192.168.10.1/g' package/base-files/files/bin/config_generate
 
 echo "========== Cudy TR3000 DIY 完成 =========="
