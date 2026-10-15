@@ -1,159 +1,264 @@
-#
-# https://github.com/P3TERX/Actions-OpenWrt
-#
-# File: .github/workflows/update-checker.yml
-# Description: Source code update checker
-#
-# Copyright (c) 2019-2024 P3TERX <https://p3terx.com>
-# Copyright (c) 2025 icyray
-#
-# This is free software, licensed under the MIT License.
-# See /LICENSE for more information.
-#
 
 name: Update Checker
 
 on:
   workflow_dispatch:
   schedule:
-   - cron: 0 0 */5 * *
+    - cron: "0 0 */5 * *"
+
+# 只授予这个工作流需要的权限
+permissions:
+  contents: read
+  actions: write
+  issues: write
 
 jobs:
+  # 第一部分：读取所有启用了更新检查的编译工作流
   get-repo:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+
     outputs:
       repo: ${{ steps.get-env.outputs.result }}
 
     steps:
       - name: Checkout
-        uses: actions/checkout@main
+        uses: actions/checkout@v7
 
       - name: Set up Node.js
-        uses: actions/setup-node@main
+        uses: actions/setup-node@v7
         with:
           node-version: "24"
+          package-manager-cache: false
 
-      - name: Install dependencies
-        run: |
-          npm init -y
-          npm install js-yaml
+      - name: Install YAML parser
+        run: npm install --no-save --no-package-lock js-yaml
 
       - name: Get environment from workflows
         id: get-env
-        uses: actions/github-script@main
+        uses: actions/github-script@v9
         with:
           script: |
             const fs = require('fs');
             const path = require('path');
             const yaml = require('js-yaml');
+
             const result = [];
-
             const globber = await glob.create('./.github/workflows/*.yml');
+
             for await (const file of globber.globGenerator()) {
-                const fileContents = fs.readFileSync(file, 'utf8');
-                const workflow = yaml.load(fileContents);
-                const filename = path.basename(file, '.yml');
+              const fileContents = fs.readFileSync(file, 'utf8');
+              const workflow = yaml.load(fileContents);
+              const filename = path.basename(file, '.yml');
+              const workflowFile = path.basename(file);
 
-                if (!(workflow && workflow.env && workflow.env.UPDATER_ENABLED)) {
-                    console.log('Skipping disabled workflow: ' + file);
-                    continue;
-                }
+              if (
+                !workflow ||
+                !workflow.env ||
+                workflow.env.UPDATER_ENABLED !== true &&
+                workflow.env.UPDATER_ENABLED !== 'true'
+              ) {
+                console.log('Skipping disabled workflow: ' + file);
+                continue;
+              }
 
-                const workflowName = workflow.name || filename;
-                const match = workflow.env.REPO_URL.match(/github\.com[\/:]([^\/]+)\/([^\/\s]+?)(?:\.git)?(?:\/.*)?$/);
-                const sourceRepo = match ? `${match[1]}/${match[2]}` : null;
-                const repoBranch = workflow.env.REPO_BRANCH;
-                const repoDefcfg = workflow.env && workflow.env.UPDATER_DEFCONFIG ? workflow.env.UPDATER_DEFCONFIG : null;
+              const repoUrl = workflow.env.REPO_URL || '';
+              const match = repoUrl.match(
+                /github\.com[/:]([^/\s]+)\/([^/\s]+?)(?:\.git)?(?:\/.*)?$/
+              );
 
-                if (!(sourceRepo && repoBranch)) {
-                    console.log('Invalid workflow: ' + file);
-                    continue;
-                }
+              const sourceRepo = match
+                ? `${match[1]}/${match[2]}`
+                : null;
 
-                result.push({
-                    filename: filename,
-                    name: workflowName,
-                    repo: sourceRepo,
-                    branch: repoBranch,
-                    defcfg: repoDefcfg,
-                });
+              const repoBranch = workflow.env.REPO_BRANCH;
+              const repoDefcfg = workflow.env.UPDATER_DEFCONFIG || '';
+
+              if (!sourceRepo || !repoBranch) {
+                console.log('Invalid workflow configuration: ' + file);
+                continue;
+              }
+
+              result.push({
+                filename: filename,
+                workflow_file: workflowFile,
+                name: workflow.name || filename,
+                repo: sourceRepo,
+                branch: repoBranch,
+                defcfg: repoDefcfg
+              });
             }
 
-            console.log(result);
+            console.log(JSON.stringify(result));
             return result;
 
+  # 第二部分：检查源码和 defconfig 是否有更新
   check-and-trigger:
     needs: get-repo
+    if: needs.get-repo.outputs.repo != ''
+
+    runs-on: ubuntu-24.04
+
     strategy:
+      fail-fast: false
       matrix:
         repo: ${{ fromJson(needs.get-repo.outputs.repo) }}
-    runs-on: ubuntu-latest
+
     steps:
-      - name: Get commit hash
+      # 查询上游源码分支最新提交
+      - name: Get source commit hash
         id: get-hash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SOURCE_REPO: ${{ matrix.repo.repo }}
+          SOURCE_BRANCH: ${{ matrix.repo.branch }}
         run: |
-          repo_data=$(curl -s -L 'https://api.github.com/repos/${{ matrix.repo.repo }}/commits/${{ matrix.repo.branch }}')
+          set -euo pipefail
 
-          repo_hash=$(echo "$repo_data" | jq -n -R -r '[inputs] | join("\n") | fromjson? | .sha // empty')
-          repo_message=$(echo "$repo_data" | jq -n -R -r '[inputs] | join("\n") | fromjson? | .commit.message | select(type == "string") | split("\n")[0] // empty')
+          repo_data=$(gh api \
+            "repos/${SOURCE_REPO}/commits/${SOURCE_BRANCH}")
 
-          echo "repo_hash=${repo_hash}" >> $GITHUB_OUTPUT
-          echo "repo_message=${repo_message}" >> $GITHUB_OUTPUT
+          repo_hash=$(printf '%s' "$repo_data" | jq -r '.sha // empty')
+          repo_message=$(printf '%s' "$repo_data" \
+            | jq -r '.commit.message // empty' \
+            | head -n 1)
 
+          if [ -z "$repo_hash" ]; then
+            echo "ERROR: 无法获取上游源码提交记录"
+            exit 1
+          fi
+
+          echo "repo_hash=$repo_hash" >> "$GITHUB_OUTPUT"
+          echo "repo_message=$repo_message" >> "$GITHUB_OUTPUT"
+
+          echo "Source repository: $SOURCE_REPO"
+          echo "Source branch: $SOURCE_BRANCH"
+          echo "Latest commit: $repo_hash"
+          echo "Commit message: $repo_message"
+
+      # 查询上游 defconfig 文件的最新修改提交
       - name: Get defconfig commit hash
         id: get-def-hash
-        if: matrix.repo.defcfg
+        if: matrix.repo.defcfg != ''
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SOURCE_REPO: ${{ matrix.repo.repo }}
+          SOURCE_BRANCH: ${{ matrix.repo.branch }}
+          SOURCE_DEFCONFIG: ${{ matrix.repo.defcfg }}
         run: |
-          def_data=$(curl -s -L 'https://api.github.com/repos/${{ matrix.repo.repo }}/commits?path=${{ matrix.repo.defcfg }}&sha=${{ matrix.repo.branch }}')
+          set -euo pipefail
 
-          def_hash=$(echo "$def_data" | jq -n -R -r '[inputs] | join("\n") | fromjson? | .[0].sha // empty')
-          def_message=$(echo "$def_data" | jq -n -R -r '[inputs] | join("\n") | fromjson? | .[0].commit.message | select(type == "string") | split("\n")[0] // empty')
+          def_data=$(gh api \
+            "repos/${SOURCE_REPO}/commits?path=${SOURCE_DEFCONFIG}&sha=${SOURCE_BRANCH}&per_page=1")
 
-          echo "def_hash=${def_hash}" >> $GITHUB_OUTPUT
-          echo "def_message=${def_message}" >> $GITHUB_OUTPUT
+          def_hash=$(printf '%s' "$def_data" \
+            | jq -r '.[0].sha // empty')
 
-      - name: Check repo hash
+          def_message=$(printf '%s' "$def_data" \
+            | jq -r '.[0].commit.message // empty' \
+            | head -n 1)
+
+          echo "def_hash=$def_hash" >> "$GITHUB_OUTPUT"
+          echo "def_message=$def_message" >> "$GITHUB_OUTPUT"
+
+          if [ -n "$def_hash" ]; then
+            echo "Latest defconfig commit: $def_hash"
+            echo "Defconfig message: $def_message"
+          else
+            echo "No defconfig commit found for $SOURCE_DEFCONFIG"
+          fi
+
+      # 检查源码提交是否已经记录
+      - name: Check source commit cache
         id: cache-repo-hash
-        uses: actions/cache@main
+        uses: actions/cache@v5
         with:
           path: .repo-hash
-          key: repo-hash_${{matrix.repo.filename}}_${{ steps.get-hash.outputs.repo_hash }}
-          lookup-only: true
+          key: repo-hash-${{ matrix.repo.filename }}-${{ steps.get-hash.outputs.repo_hash }}
 
-      - name: Check defconfig hash
+      # 检查 defconfig 提交是否已经记录
+      - name: Check defconfig cache
         id: cache-def-hash
-        if: matrix.repo.defcfg && steps.get-def-hash.outputs.def_hash != 'null'
-        uses: actions/cache@main
+        if: matrix.repo.defcfg != '' && steps.get-def-hash.outputs.def_hash != ''
+        uses: actions/cache@v5
         with:
           path: .def-hash
-          key: def-hash_${{matrix.repo.filename}}_${{ steps.get-def-hash.outputs.def_hash }}
-          lookup-only: true
+          key: def-hash-${{ matrix.repo.filename }}-${{ steps.get-def-hash.outputs.def_hash }}
 
-      - name: Cache repo hash
+      # 缓存未命中时记录当前源码提交
+      - name: Save source commit marker
         if: steps.cache-repo-hash.outputs.cache-hit != 'true'
-        run: echo ${{ steps.get-hash.outputs.repo_hash }} > .repo-hash
+        run: |
+          printf '%s\n' \
+            "${{ steps.get-hash.outputs.repo_hash }}" > .repo-hash
 
-      - name: Cache defconfig hash
-        if: matrix.repo.defcfg && steps.get-def-hash.outputs.def_hash != 'null' && steps.cache-def-hash.outputs.cache-hit != 'true'
-        run: echo ${{ steps.get-def-hash.outputs.def_hash }} > .def-hash
+      # 缓存未命中时记录当前 defconfig 提交
+      - name: Save defconfig marker
+        if: matrix.repo.defcfg != '' && steps.get-def-hash.outputs.def_hash != '' && steps.cache-def-hash.outputs.cache-hit != 'true'
+        run: |
+          printf '%s\n' \
+            "${{ steps.get-def-hash.outputs.def_hash }}" > .def-hash
 
-      - name: Notification for new defconfig
-        if: matrix.repo.defcfg && steps.get-def-hash.outputs.def_hash != 'null' && steps.cache-def-hash.outputs.cache-hit != 'true'
-        uses: dacbd/create-issue-action@main
-        with:
-          title: "New def-config available for workflow ${{ matrix.repo.name }}"
-          body: |
-            A new defconfig has been detected for workflow `${{ matrix.repo.name }}`.
-            - **Repo**: `${{ matrix.repo.repo }}`
-            - **Branch**: `${{ matrix.repo.branch }}`
-            - **Defconfig**: `${{ matrix.repo.defcfg }}`
-            - **Message**: ${{ steps.get-def-hash.outputs.def_message }}
-            - **Link**: <https://github.com/${{ matrix.repo.repo }}/commit/${{ steps.get-def-hash.outputs.def_hash }}>
-          labels: update-checker, defconfig-update
-          token: ${{ secrets.GITHUB_TOKEN }}
+      # 发现新 defconfig 时创建 Issue 提醒
+      - name: Notify new defconfig
+        if: matrix.repo.defcfg != '' && steps.get-def-hash.outputs.def_hash != '' && steps.cache-def-hash.outputs.cache-hit != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ISSUE_TITLE: New def-config available for workflow ${{ matrix.repo.name }}
+          SOURCE_REPO: ${{ matrix.repo.repo }}
+          SOURCE_BRANCH: ${{ matrix.repo.branch }}
+          SOURCE_DEFCONFIG: ${{ matrix.repo.defcfg }}
+          DEF_HASH: ${{ steps.get-def-hash.outputs.def_hash }}
+          DEF_MESSAGE: ${{ steps.get-def-hash.outputs.def_message }}
+        run: |
+          set -euo pipefail
 
+          # 如果标签不存在则创建；已存在时继续执行
+          gh label create update-checker \
+            --color 0E8A16 \
+            --description "Update Checker notification" \
+            2>/dev/null || true
+
+          gh label create defconfig-update \
+            --color 1D76DB \
+            --description "Upstream defconfig update" \
+            2>/dev/null || true
+
+          ISSUE_BODY=$(cat <<EOF
+          A new defconfig revision has been detected.
+
+          - Repository: ${SOURCE_REPO}
+          - Branch: ${SOURCE_BRANCH}
+          - Defconfig: ${SOURCE_DEFCONFIG}
+          - Commit: ${DEF_HASH}
+          - Message: ${DEF_MESSAGE}
+
+          Commit link:
+          https://github.com/${SOURCE_REPO}/commit/${DEF_HASH}
+          EOF
+          )
+
+          gh issue create \
+            --title "$ISSUE_TITLE" \
+            --body "$ISSUE_BODY" \
+            --label update-checker \
+            --label defconfig-update
+
+      # 上游源码有新提交时触发对应的固件编译工作流
       - name: Trigger build
-        if: steps.cache-repo-hash.outputs.cache-hit != 'true' && success()
-        uses: benc-uk/workflow-dispatch@main
-        with:
-          workflow: ${{ matrix.repo.name }}
+        if: steps.cache-repo-hash.outputs.cache-hit != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          WORKFLOW_FILE: ${{ matrix.repo.workflow_file }}
+        run: |
+          set -euo pipefail
+
+          echo "Detected a new source commit."
+          echo "Triggering workflow: $WORKFLOW_FILE"
+          echo "Branch: $GITHUB_REF_NAME"
+
+          gh api \
+            --method POST \
+            "repos/${GITHUB_REPOSITORY}/actions/workflows/${WORKFLOW_FILE}/dispatches" \
+            -f "ref=${GITHUB_REF_NAME}"
+
+          echo "Build workflow dispatch request completed."
