@@ -198,11 +198,13 @@ jobs:
           printf '%s\n' \
             "${{ steps.get-def-hash.outputs.def_hash }}" > .def-hash
 
-      # 发现新 defconfig 时创建 Issue 提醒
+           
+      # 发现新的 defconfig 时创建 Issue 提醒
       - name: Notify new defconfig
         if: matrix.repo.defcfg != '' && steps.get-def-hash.outputs.def_hash != '' && steps.cache-def-hash.outputs.cache-hit != 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
           ISSUE_TITLE: New def-config available for workflow ${{ matrix.repo.name }}
           SOURCE_REPO: ${{ matrix.repo.repo }}
           SOURCE_BRANCH: ${{ matrix.repo.branch }}
@@ -212,13 +214,15 @@ jobs:
         run: |
           set -euo pipefail
 
-          # 如果标签不存在则创建；已存在时继续执行
+          # 指定当前仓库，避免依赖本地 .git 目录
           gh label create update-checker \
+            --repo "$GH_REPO" \
             --color 0E8A16 \
             --description "Update Checker notification" \
             2>/dev/null || true
 
           gh label create defconfig-update \
+            --repo "$GH_REPO" \
             --color 1D76DB \
             --description "Upstream defconfig update" \
             2>/dev/null || true
@@ -238,6 +242,7 @@ jobs:
           )
 
           gh issue create \
+            --repo "$GH_REPO" \
             --title "$ISSUE_TITLE" \
             --body "$ISSUE_BODY" \
             --label update-checker \
