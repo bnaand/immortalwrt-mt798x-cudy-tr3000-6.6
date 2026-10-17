@@ -1,0 +1,304 @@
+
+name: Build Cudy TR3000 ImmortalWrt 25.12
+
+on:
+  workflow_dispatch:
+  schedule:
+    # 每天北京时间 11:17 检查上游更新
+    - cron: "17 3 * * *"
+
+permissions:
+  contents: write
+
+env:
+  REPO_URL: https://github.com/chasey-dev/immortalwrt-mt798x-rebase
+  REPO_BRANCH: 25.12
+  CONFIG_FILE: cudy-tr3000.config
+  DIY_SH: diy.sh
+  TZ: Asia/Shanghai
+
+jobs:
+  check:
+    name: Check upstream updates
+    runs-on: ubuntu-22.04
+    outputs:
+      changed: ${{ steps.check.outputs.changed }}
+      source_sha: ${{ steps.check.outputs.source_sha }}
+
+    steps:
+      - name: Compare upstream with latest release
+        id: check
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          SOURCE_SHA="$(git ls-remote \
+            "$REPO_URL" "refs/heads/$REPO_BRANCH" | awk '{print $1}')"
+
+          if [[ ! "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "ERROR: 无法获取上游提交"
+            exit 1
+          fi
+
+          echo "source_sha=$SOURCE_SHA" >> "$GITHUB_OUTPUT"
+          echo "当前上游提交：$SOURCE_SHA"
+
+          LAST_BODY="$(gh release view \
+            --repo "$GITHUB_REPOSITORY" \
+            --json body --jq '.body' 2>/dev/null || true)"
+
+          LAST_SHA="$(printf '%s\n' "$LAST_BODY" \
+            | grep -m1 -oE 'Upstream commit: [0-9a-f]{40}' \
+            | awk '{print $3}' || true)"
+
+          if [[ "$SOURCE_SHA" == "$LAST_SHA" ]]; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "上游没有新提交，跳过编译。"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            echo "发现上游更新，准备编译。"
+          fi
+
+  build:
+    name: Build firmware
+    needs: check
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      needs.check.outputs.changed == 'true'
+
+    runs-on: ubuntu-22.04
+    timeout-minutes: 360
+
+    steps:
+      - name: Checkout build configuration
+        uses: actions/checkout@v5
+
+      - name: Initialization environment
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            ack antlr3 asciidoc autoconf automake autopoint \
+            binutils bison build-essential bzip2 ccache clang cmake \
+            cpio curl device-tree-compiler ecj fastjar flex gawk gettext \
+            gcc-multilib g++-multilib git gnutls-dev gperf \
+            help2man intltool lib32gcc-s1 libc6-dev-i386 libelf-dev \
+            libglib2.0-dev libgmp3-dev libltdl-dev libmpc-dev libmpfr-dev \
+            libncurses-dev libpython3-dev libreadline-dev libssl-dev \
+            libtool libyaml-dev libz-dev lld llvm lrzsz mkisofs \
+            nano ninja-build p7zip-full patch pkgconf python3 \
+            python3-pip python3-ply python3-docutils python3-pyelftools \
+            qemu-utils re2c rsync scons squashfs-tools subversion swig \
+            texinfo uglifyjs upx-ucl unzip wget xmlto xxd zlib1g-dev zstd
+
+          sudo timedatectl set-timezone "$TZ"
+          df -hT
+
+      - name: Clone ImmortalWrt source
+        run: |
+          git clone --depth 1 \
+            --branch "$REPO_BRANCH" \
+            "$REPO_URL" openwrt
+
+          cd openwrt
+          git rev-parse HEAD
+
+          echo "SOURCE_SHA=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+
+      - name: Verify target profile
+        working-directory: openwrt
+        run: |
+          set -euo pipefail
+
+          PROFILE="cudy_tr3000-v1-ubootmod"
+          DTS="target/linux/mediatek/dts/mt7981b-cudy-tr3000-v1-ubootmod.dts"
+          IMAGE_MK="target/linux/mediatek/image/filogic.mk"
+
+          test -f "$DTS" || {
+            echo "ERROR: 缺少设备 DTS：$DTS"
+            exit 1
+          }
+
+          grep -q "TARGET_DEVICES += $PROFILE" "$IMAGE_MK" || {
+            echo "ERROR: 源码没有注册设备 Profile：$PROFILE"
+            exit 1
+          }
+
+          grep -q 'reg = <0x5c0000 0x7a40000>' "$DTS" || {
+            echo "ERROR: UBI 分区布局与预期的 122 MiB 不一致"
+            exit 1
+          }
+
+          echo "已确认设备 Profile：$PROFILE"
+          echo "已确认预期 UBI 分区布局。"
+
+      - name: Update feeds
+        working-directory: openwrt
+        run: ./scripts/feeds update -a
+
+      - name: Install feeds
+        working-directory: openwrt
+        run: ./scripts/feeds install -a
+
+      - name: Load configuration and run DIY
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          test -s "$CONFIG_FILE" || {
+            echo "ERROR: 找不到配置文件 $CONFIG_FILE"
+            exit 1
+          }
+
+          test -s "$DIY_SH" || {
+            echo "ERROR: 找不到 DIY 脚本 $DIY_SH"
+            exit 1
+          }
+
+          cp "$CONFIG_FILE" openwrt/.config
+
+          cd openwrt
+
+          # 移除旧版内核配置标记，使用新源码自己的内核版本。
+          sed -i '/^CONFIG_LINUX_6_6=y$/d' .config
+
+          # 强制选择正确设备，避免编译成其他路由器的固件。
+          sed -i \
+            '/^CONFIG_TARGET_mediatek_filogic_DEVICE_.*=y$/d' \
+            .config
+
+          echo \
+            'CONFIG_TARGET_mediatek_filogic_DEVICE_cudy_tr3000-v1-ubootmod=y' \
+            >> .config
+
+          bash "$GITHUB_WORKSPACE/$DIY_SH"
+
+      - name: Resolve configuration
+        working-directory: openwrt
+        run: |
+          set -euo pipefail
+
+          make defconfig
+
+          grep -qx \
+            'CONFIG_TARGET_mediatek_filogic_DEVICE_cudy_tr3000-v1-ubootmod=y' \
+            .config || {
+              echo "ERROR: 目标 Profile 未被 make defconfig 保留"
+              exit 1
+            }
+
+          echo "===== 实际设备配置 ====="
+          grep '^CONFIG_TARGET.*DEVICE.*=y' .config
+
+          echo "===== PassWall2 配置 ====="
+          grep -E '^CONFIG_PACKAGE_(luci-app-passwall2|xray-core)=y$' \
+            .config || true
+
+      - name: Download packages
+        working-directory: openwrt
+        run: |
+          set -euo pipefail
+
+          make download -j8
+
+          find dl -size -1024c -exec ls -l {} \;
+          find dl -size -1024c -exec rm -f {} \;
+
+      - name: Compile firmware
+        id: compile
+        working-directory: openwrt
+        run: |
+          set -euo pipefail
+
+          echo "===== 开始编译 ====="
+          echo "上游提交：$SOURCE_SHA"
+          echo "并行线程数：$(nproc)"
+
+          make -j"$(nproc)" || make -j1 V=s
+
+          TARGET_DIR="bin/targets/mediatek/filogic"
+
+          test -d "$TARGET_DIR" || {
+            echo "ERROR: 未找到 MTK Filogic 固件输出目录"
+            exit 1
+          }
+
+          find "$TARGET_DIR" -maxdepth 1 -type f -printf '%f\n'
+
+          echo "DEVICE_NAME=cudy_tr3000-v1-ubootmod" \
+            >> "$GITHUB_ENV"
+          echo "FILE_DATE=$(date +'%Y%m%d-%H%M')" \
+            >> "$GITHUB_ENV"
+
+      - name: Organize firmware
+        id: organize
+        run: |
+          set -euo pipefail
+
+          TARGET_DIR="openwrt/bin/targets/mediatek/filogic"
+
+          test -d "$TARGET_DIR"
+
+          rm -rf "$TARGET_DIR/packages"
+
+          echo "FIRMWARE=$GITHUB_WORKSPACE/$TARGET_DIR" \
+            >> "$GITHUB_ENV"
+
+          echo "===== 固件文件 ====="
+          ls -lh "$TARGET_DIR"
+
+          if ! find "$TARGET_DIR" -maxdepth 1 -type f \
+            \( -name '*sysupgrade.itb' -o -name '*sysupgrade.bin' \) \
+            | grep -q .; then
+            echo "ERROR: 未找到可识别的 sysupgrade 固件"
+            exit 1
+          fi
+
+      - name: Upload firmware artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: Cudy_TR3000_ubootmod_${{ env.FILE_DATE }}
+          path: ${{ env.FIRMWARE }}/*
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Generate release notes
+        id: release
+        run: |
+          set -euo pipefail
+
+          TAG="build-$(date +'%Y%m%d-%H%M%S')"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+          cat > cudy-tr3000.md <<EOF
+          # Cudy TR3000 v1 U-Boot Mod
+
+          - 源码：$REPO_URL
+          - 分支：$REPO_BRANCH
+          - Upstream commit: $SOURCE_SHA
+          - 设备 Profile：cudy_tr3000-v1-ubootmod
+          - UBI 布局：122 MiB
+          - 默认管理地址：192.168.10.1
+          - 编译时间：$(date +'%Y-%m-%d %H:%M:%S %Z')
+
+          ## 注意事项
+
+          本固件适用于与此 U-Boot Mod 分区布局匹配的设备。
+          刷写前请核对硬件版本、U-Boot 版本和分区布局。
+          EOF
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.release.outputs.tag }}
+          name: Cudy TR3000 ImmortalWrt ${{ steps.release.outputs.tag }}
+          body_path: cudy-tr3000.md
+          files: ${{ env.FIRMWARE }}/*
+          fail_on_unmatched_files: true
+
+      - name: Disk usage
+        if: always()
+        run: df -hT
